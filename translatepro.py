@@ -5,10 +5,9 @@ import tempfile
 import os
 from pathlib import Path
 import time
-from transformers import MarianMTModel, MarianTokenizer
-import torch
 import base64
 from io import BytesIO
+import requests
 
 st.set_page_config(
     page_title="Document Translator",
@@ -16,51 +15,36 @@ st.set_page_config(
     layout="wide"
 )
 
-# Cache the models to avoid reloading them
-@st.cache_resource
-def load_es_en_model():
-    model_name = "Helsinki-NLP/opus-mt-es-en"
-    tokenizer = MarianTokenizer.from_pretrained(model_name)
-    model = MarianMTModel.from_pretrained(model_name)
-    return tokenizer, model
+# Use LibreTranslate API (self-hosted or public instances)
+LIBRE_TRANSLATE_INSTANCES = [
+    "https://translate.argosopentech.com",  # Public instance
+    "https://libretranslate.de",            # Public instance
+    "https://translate.terraprint.co"       # Public instance
+]
 
-@st.cache_resource
-def load_zh_en_model():
-    model_name = "Helsinki-NLP/opus-mt-zh-en"
-    tokenizer = MarianTokenizer.from_pretrained(model_name)
-    model = MarianMTModel.from_pretrained(model_name)
-    return tokenizer, model
-
-# Translation function
-def translate_text(text, source_lang):
-    # Split text into manageable chunks (about 100 words per chunk)
+def translate_text_libre(text, source_lang, target_lang="en"):
+    """Translate text using LibreTranslate API"""
+    
+    # Convert language codes
+    lang_map = {
+        "Spanish": "es",
+        "Chinese (Mandarin)": "zh"
+    }
+    
+    source = lang_map.get(source_lang, "auto")
+    
+    # Split text into chunks of about 1000 characters to avoid request limits
     chunks = []
-    current_chunk = []
-    current_word_count = 0
+    for i in range(0, len(text), 1000):
+        chunks.append(text[i:i+1000])
     
-    for line in text.split('\n'):
-        words = line.split()
-        if current_word_count + len(words) > 100:
-            chunks.append(' '.join(current_chunk))
-            current_chunk = words
-            current_word_count = len(words)
-        else:
-            current_chunk.extend(words)
-            current_word_count += len(words)
-    
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-    
-    # Load appropriate model based on source language
-    if source_lang == 'Spanish':
-        tokenizer, model = load_es_en_model()
-    else:  # Chinese
-        tokenizer, model = load_zh_en_model()
-    
-    # Translate each chunk
     translated_chunks = []
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    # Try different instances if one fails
+    instance_index = 0
+    current_instance = LIBRE_TRANSLATE_INSTANCES[instance_index]
     
     for i, chunk in enumerate(chunks):
         status_text.text(f"Translating chunk {i+1}/{len(chunks)}")
@@ -71,28 +55,43 @@ def translate_text(text, source_lang):
             progress_bar.progress((i + 1) / len(chunks))
             continue
         
-        # Tokenize and translate
-        batch = tokenizer([chunk], return_tensors="pt", padding=True)
-        
-        # Handle device placement
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = model.to(device)
-        batch = {k: v.to(device) for k, v in batch.items()}
-        
-        # Generate translation with a reasonable max length
-        gen_kwargs = {
-            "max_length": min(512, len(chunk.split()) * 2),  # Roughly double the input length
-            "num_beams": 4,
-            "early_stopping": True
-        }
-        
-        # Translate
-        with torch.no_grad():
-            generated_ids = model.generate(**batch, **gen_kwargs)
-        
-        # Decode the generated output
-        translated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        translated_chunks.append(translated_text)
+        # Try to translate with current instance
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                payload = {
+                    "q": chunk,
+                    "source": source,
+                    "target": target_lang,
+                    "format": "text"
+                }
+                
+                headers = {"Content-Type": "application/json"}
+                
+                response = requests.post(
+                    f"{current_instance}/translate",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    translated_chunks.append(result.get("translatedText", ""))
+                    break
+                else:
+                    # If this instance fails, try another one
+                    instance_index = (instance_index + 1) % len(LIBRE_TRANSLATE_INSTANCES)
+                    current_instance = LIBRE_TRANSLATE_INSTANCES[instance_index]
+                    st.warning(f"Switching to alternative translation server... ({retry+1}/{max_retries})")
+                    time.sleep(1)  # Wait a bit before retrying
+                    
+            except Exception as e:
+                # If request fails, try another instance
+                instance_index = (instance_index + 1) % len(LIBRE_TRANSLATE_INSTANCES)
+                current_instance = LIBRE_TRANSLATE_INSTANCES[instance_index]
+                st.warning(f"Switching to alternative translation server... ({retry+1}/{max_retries})")
+                time.sleep(1)  # Wait a bit before retrying
         
         # Update progress
         progress_bar.progress((i + 1) / len(chunks))
@@ -149,11 +148,6 @@ def save_docx(translated_text):
     
     return docx_bytes
 
-def get_download_link(content, filename, text):
-    b64 = base64.b64encode(content).decode()
-    href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">{text}</a>'
-    return href
-
 # Main UI
 st.title("🌐 Document Translator")
 st.subheader("Translate documents from Spanish and Mandarin to English")
@@ -192,7 +186,7 @@ if uploaded_file is not None:
         if st.button("Translate Document"):
             with st.spinner("Translating... This may take several minutes for large documents"):
                 start_time = time.time()
-                translated_text = translate_text(text, source_language)
+                translated_text = translate_text_libre(text, source_language)
                 end_time = time.time()
                 
                 st.success(f"Translation completed in {end_time - start_time:.2f} seconds!")
@@ -238,20 +232,19 @@ with st.expander("How to use this app"):
 
 with st.expander("About this translator"):
     st.markdown("""
-    This document translator uses the Marian Neural Machine Translation (MarianNMT) models to translate from 
-    Spanish and Chinese to English. It's designed to handle large documents (30+ pages) efficiently.
+    This document translator uses free translation APIs to translate documents from Spanish and Chinese to English.
+    It's designed to handle large documents (30+ pages) efficiently by splitting them into smaller chunks.
     
     **Features:**
-    - Free and open-source translation
+    - Free translation
     - Support for PDF, DOCX, and TXT files
     - Word-for-word translation
-    - No usage limits
-    - Local processing (no data sent to external APIs)
+    - No installation of ML models required
     - Download options for the translated text
     
-    The translation quality depends on the complexity of the source text and document formatting.
+    The translation quality depends on the APIs used and the complexity of the source text.
     """)
 
 # Footer
 st.markdown("---")
-st.markdown("Powered by Hugging Face's MarianMT models")
+st.markdown("Using free LibreTranslate servers for translation")
